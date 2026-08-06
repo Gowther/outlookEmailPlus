@@ -15,7 +15,11 @@
 <body>
     {% if auto_import %}
     <div class="card">
-        {% if error %}
+        {% if auto_logout_complete %}
+        <h2>✅ Microsoft 账号已退出</h2>
+        <p>本批次授权与自动导入已完成，可以关闭此窗口。</p>
+        {% if auto_result.warning %}<p class="guidance">⚠️ {{ auto_result.warning }}</p>{% endif %}
+        {% elif error %}
         <h2>⚠️ 自动导入未完成</h2>
         <p><strong>{{ error_code }}</strong></p>
         <p>{{ error_description }}</p>

@@ -68,7 +68,12 @@ def _save_validation_guidance(error_msg: str) -> str | None:
     return None
 
 
-def _build_oauth_config(data: Dict[str, Any], *, prompt_login: bool = False) -> Dict[str, Any]:
+def _build_oauth_config(
+    data: Dict[str, Any],
+    *,
+    prompt_login: bool = False,
+    login_hint: str = "",
+) -> Dict[str, Any]:
     """从 API 请求构造 OAuth 配置，保证手动和自动流程使用同一套参数。"""
     return {
         "client_id": (data.get("client_id") or "").strip(),
@@ -78,6 +83,7 @@ def _build_oauth_config(data: Dict[str, Any], *, prompt_login: bool = False) -> 
         "tenant": COMPATIBLE_TENANT,
         "prompt_consent": bool(data.get("prompt_consent")),
         "prompt_login": prompt_login,
+        "login_hint": (login_hint or "").strip(),
     }
 
 
@@ -123,18 +129,40 @@ def _build_auto_import_context(
     if not _is_graph_scope(scope):
         return None, "批量自动导入仅支持 Graph 邮件，请先选择“Graph 邮件”Scope 预设"
 
-    return (
-        {
-            "batch_id": secrets.token_urlsafe(12),
-            "total": count,
-            "current": 1,
-            "remaining": count,
-            "prompt_consent": bool(data.get("prompt_consent")),
-            # 默认强制显示登录页，避免 Microsoft 复用上一个账号而重复导入。
-            "prompt_login": bool(auto_import.get("force_login", True)),
-        },
-        None,
-    )
+    login_hints: list[str] = []
+    seen_login_hints: set[str] = set()
+    raw_login_hints = auto_import.get("login_hints")
+    if raw_login_hints is not None:
+        if not isinstance(raw_login_hints, list):
+            return None, "批量预填账号列表格式无效"
+        for item in raw_login_hints:
+            if not isinstance(item, str):
+                return None, "批量预填账号列表只能包含邮箱地址"
+            email = item.strip()
+            if not email or "@" not in email or len(email) > 254:
+                return None, "批量预填账号列表包含无效邮箱地址"
+            normalized_email = email.lower()
+            if normalized_email in seen_login_hints:
+                return None, "批量预填账号列表包含重复邮箱地址"
+            login_hints.append(email)
+            seen_login_hints.add(normalized_email)
+        if len(login_hints) != count:
+            return None, "批量预填账号数量必须与本批次账号数一致"
+
+    context = {
+        "batch_id": secrets.token_urlsafe(12),
+        "total": count,
+        "current": 1,
+        "remaining": count,
+        "prompt_consent": bool(data.get("prompt_consent")),
+        # 默认强制显示登录页，避免 Microsoft 复用上一个账号而重复导入。
+        "prompt_login": bool(auto_import.get("force_login", True)),
+    }
+    if login_hints:
+        # 仅存于服务端 OAuth flow，用于依次预填 Microsoft 登录页的账号框。
+        context["login_hints"] = login_hints
+        context["login_hint"] = login_hints[0]
+    return context, None
 
 
 def _oauth_config_from_flow(flow_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -148,6 +176,7 @@ def _oauth_config_from_flow(flow_data: Dict[str, Any]) -> Dict[str, Any]:
         "tenant": flow_data.get("tenant", COMPATIBLE_TENANT),
         "prompt_consent": bool(auto_import.get("prompt_consent")),
         "prompt_login": bool(auto_import.get("prompt_login")),
+        "login_hint": (auto_import.get("login_hint") or "").strip(),
     }
 
 
@@ -315,9 +344,45 @@ def _resume_auto_import_after_logout(error: str = "", error_description: str = "
             "Microsoft 注销完成后无法恢复下一账号授权，请重新发起当前批次",
         )
 
-    next_state = continuation.get("next_state")
     batch_id = continuation.get("batch_id")
-    if not isinstance(next_state, str) or not next_state or not isinstance(batch_id, str) or not batch_id:
+    if not isinstance(batch_id, str) or not batch_id:
+        return _render_auto_import_error(
+            "OAUTH_LOGOUT_CONTINUATION_INVALID",
+            "Microsoft 注销续接信息无效，请重新发起当前批次",
+        )
+
+    if continuation.get("completed") is True:
+        current = continuation.get("current")
+        total = continuation.get("total")
+        warning = continuation.get("warning") or ""
+        if type(current) is not int or type(total) is not int or not 1 <= current <= total:
+            return _render_auto_import_error(
+                "OAUTH_LOGOUT_CONTINUATION_INVALID",
+                "Microsoft 注销续接信息无效，请重新发起当前批次",
+            )
+        if error:
+            return _render_auto_import_error(
+                "OAUTH_MICROSOFT_LOGOUT_FAILED",
+                error_description or f"Microsoft 注销失败：{error}",
+                "账号已导入，但请在 Microsoft 页面手动退出当前账号后再继续",
+            )
+        logger.info("[oauth_tool] Microsoft 注销完成，连续授权批次结束 (batch=%s...)", batch_id[:8])
+        return render_template(
+            "popup_result.html",
+            error=False,
+            auto_import=True,
+            auto_logout_complete=True,
+            auto_result={
+                "status": "logout_complete",
+                "current": current,
+                "total": total,
+                "remaining": 0,
+                "warning": warning,
+            },
+        )
+
+    next_state = continuation.get("next_state")
+    if not isinstance(next_state, str) or not next_state:
         return _render_auto_import_error(
             "OAUTH_LOGOUT_CONTINUATION_INVALID",
             "Microsoft 注销续接信息无效，请重新发起当前批次",
@@ -400,31 +465,49 @@ def _handle_auto_import_callback(
     remaining = max(int(auto_import.get("remaining", 1)) - 1, 0)
     result.update({"status": "success", "current": current, "total": total, "remaining": remaining})
 
-    next_authorize_url = ""
     logout_url = ""
+    logout_continuation: Optional[Dict[str, Any]] = None
     if remaining:
         next_context = dict(auto_import)
         next_context.update({"current": current + 1, "remaining": remaining})
+        login_hints = next_context.get("login_hints") or []
+        if login_hints:
+            next_context["login_hint"] = login_hints[current]
+        next_oauth_config = _oauth_config_from_flow(flow_data)
+        next_oauth_config["login_hint"] = next_context.get("login_hint", "")
         next_authorize_url, state_or_error = oauth_tool_service.start_oauth_flow(
-            _oauth_config_from_flow(flow_data),
+            next_oauth_config,
             auto_import_context=next_context,
         )
         if not next_authorize_url:
             result["warning"] = "当前账号已导入，但无法创建下一账号授权：%s" % state_or_error
         else:
-            # 注销回跳不能携带自定义 query 参数（个人 Microsoft 账号限制），
-            # 因此只将下一 flow 的 state 放在已签名的本站 Session 中。
-            session[AUTO_IMPORT_LOGOUT_SESSION_KEY] = {
+            logout_continuation = {
                 "batch_id": auto_import["batch_id"],
                 "next_state": state_or_error,
             }
             session["oauth_state"] = state_or_error
-            logout_url = oauth_tool_service.build_logout_url(
-                tenant=flow_data.get("tenant", COMPATIBLE_TENANT),
-                post_logout_redirect_uri=flow_data["redirect_uri"],
-            )
-            # 下一条授权 URL 只在服务端 flow 中保存；弹窗先完成 Microsoft 注销。
-            next_authorize_url = ""
+    # 最后一个账号、或下一条 flow 创建失败时，也要结束当前 Microsoft 会话；
+    # 完成页会在注销回跳后再通知主页面，避免用户误以为弹窗已经结束。
+    if logout_continuation is None:
+        logout_continuation = {
+            "batch_id": auto_import["batch_id"],
+            "completed": True,
+            "current": current,
+            "total": total,
+            "warning": result.get("warning", ""),
+        }
+
+    # 注销回跳不能携带自定义 query 参数（个人 Microsoft 账号限制），因此只将
+    # 下一 flow 的 state 放在已签名的本站 Session 中，授权 URL 始终留在服务端。
+    session[AUTO_IMPORT_LOGOUT_SESSION_KEY] = logout_continuation
+    logout_url = oauth_tool_service.build_logout_url(
+        tenant=flow_data.get("tenant", COMPATIBLE_TENANT),
+        post_logout_redirect_uri=flow_data["redirect_uri"],
+    )
+    result["logout_pending"] = True
+    # 下一条授权 URL 不渲染到浏览器页面；只由注销回跳时从服务端 flow 恢复。
+    next_authorize_url = ""
 
     return render_template(
         "popup_result.html",
@@ -473,6 +556,7 @@ def prepare_oauth() -> Any:
     oauth_config = _build_oauth_config(
         data,
         prompt_login=bool(auto_import_context and auto_import_context.get("prompt_login")),
+        login_hint=(auto_import_context or {}).get("login_hint", ""),
     )
 
     authorize_url, state_or_error = oauth_tool_service.start_oauth_flow(

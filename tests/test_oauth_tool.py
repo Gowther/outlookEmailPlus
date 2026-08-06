@@ -1147,12 +1147,16 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
             self._login(client)
             state = self._prepare_auto_flow(client)
             response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
+            logout_complete_response = client.get("/token-tool/callback")
 
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn("outlook-email-plus-auto-import", html)
         self.assertIn("auto-user@outlook.com----x----auto-client-id----fresh-refresh-token", html)
-        self.assertNotIn("/oauth2/v2.0/logout", html)
+        self.assertIn("/consumers/oauth2/v2.0/logout", html)
+        self.assertIn('"logout_pending": true', html)
+        self.assertEqual(logout_complete_response.status_code, 200)
+        self.assertIn('"status": "logout_complete"', logout_complete_response.get_data(as_text=True))
 
         with self.app.app_context():
             from outlook_web.repositories import accounts as accounts_repo
@@ -1167,6 +1171,8 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
     @patch("outlook_web.controllers.token_tool.requests.get")
     @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
     def test_callback_updates_existing_account_logs_out_and_resumes_next_flow(self, mock_exchange, mock_get):
+        from urllib.parse import parse_qs, urlparse
+
         from outlook_web.services import oauth_tool as oauth_tool_service
 
         account_id = self._insert_test_account(
@@ -1192,18 +1198,35 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
 
         with self.app.test_client() as client:
             self._login(client)
-            state = self._prepare_auto_flow(client, count=2)
+            state = self._prepare_auto_flow(
+                client,
+                auto_import={
+                    "enabled": True,
+                    "count": 2,
+                    "force_login": True,
+                    "login_hints": ["existing@outlook.com", "next@outlook.com"],
+                },
+            )
+            first_flow = oauth_tool_service.get_oauth_flow(state)
             response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
 
             logout_response = client.get("/token-tool/callback")
             consumed_response = client.get("/token-tool/callback")
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            parse_qs(urlparse(first_flow["authorize_url"]).query).get("login_hint"),
+            ["existing@outlook.com"],
+        )
         html = response.get_data(as_text=True)
         self.assertIn("正在退出当前 Microsoft 账号", html)
         self.assertIn("/consumers/oauth2/v2.0/logout", html)
         self.assertEqual(logout_response.status_code, 302)
         self.assertIn("/consumers/oauth2/v2.0/authorize", logout_response.headers["Location"])
+        self.assertEqual(
+            parse_qs(urlparse(logout_response.headers["Location"]).query).get("login_hint"),
+            ["next@outlook.com"],
+        )
         self.assertEqual(consumed_response.status_code, 200)
         self.assertIn("回调缺少 code 或 state", consumed_response.get_data(as_text=True))
         next_flows = [
@@ -1223,6 +1246,27 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
             self.assertEqual(account["refresh_token"], "fresh-refresh-token")
             self.assertEqual(account["pool_status"], "available")
             self.assertEqual(account["status"], "active")
+
+    def test_auto_import_rejects_login_hint_count_mismatch(self):
+        with self.app.test_client() as client:
+            self._login(client)
+            response = client.post(
+                "/api/token-tool/prepare",
+                json={
+                    "client_id": "auto-client-id",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://graph.microsoft.com/.default",
+                    "redirect_uri": "http://localhost:5000/token-tool/callback",
+                    "auto_import": {
+                        "enabled": True,
+                        "count": 2,
+                        "login_hints": ["only-one@outlook.com"],
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("数量必须与本批次账号数一致", response.get_json().get("message", ""))
 
     @patch("outlook_web.controllers.token_tool.requests.get")
     @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")

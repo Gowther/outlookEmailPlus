@@ -136,7 +136,7 @@
 
         <section class="token-card auto-import-card">
             <div class="token-card-title">② 批量授权并自动导入</div>
-            <p class="token-field-hint">每个账号仍由你在 Microsoft 页面登录、授权；成功回调后系统会自动换取并校验 Graph Token、创建或更新 Outlook 账号、加入邮箱池、开启 Telegram 推送，然后弹窗自动进入下一个账号。</p>
+            <p class="token-field-hint">每个账号仍由你在 Microsoft 页面登录、授权；成功回调后系统会自动换取并校验 Graph Token、创建或更新 Outlook 账号、加入邮箱池、开启 Telegram 推送，并自动退出当前 Microsoft 会话后再进入下一账号（最后一个账号也会退出）。</p>
             <div class="token-form-grid">
                 <label class="token-field">
                     <span>本批次账号数</span>
@@ -158,7 +158,9 @@
             </div>
             <div class="token-button-row auto-import-actions">
                 <button id="startAutoImportButton" type="button" class="btn-inline primary" onclick="startAutoImportBatch()">开始连续授权并自动导入</button>
+                <button id="startInvalidTokenAutoImportButton" type="button" class="btn-inline" onclick="startInvalidTokenAutoImportBatch()">按失效 Token 列表连续重新授权（预填邮箱）</button>
             </div>
+            <small class="token-field-hint">“失效 Token 列表”会读取最近刷新报 <code>invalid_grant</code> / <code>AADSTS70000</code> 的账号，并依次预填 Microsoft 登录账号；仍需你本人完成 Passkey、密码或 MFA 验证。请从浏览器无痕窗口打开本页，授权弹窗会继承该无痕会话。</small>
             <div id="autoImportProgress" class="auto-import-progress hidden" aria-live="polite">
                 <div id="autoImportProgressText" class="auto-import-progress-text"></div>
                 <label class="token-field token-field-full">

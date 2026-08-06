@@ -129,6 +129,10 @@ def start_oauth_flow(
         params["prompt"] = "login"
     elif oauth_config.get("prompt_consent"):
         params["prompt"] = "consent"
+    login_hint = (oauth_config.get("login_hint") or "").strip()
+    if login_hint:
+        # 仅预填 Microsoft 登录页的账号标识；不会跳过密码、Passkey 或 MFA 验证。
+        params["login_hint"] = login_hint
 
     authorize_url = f"{authority}/authorize?{urlencode(params)}"
     # 连续授权在 Microsoft 注销回跳后需要恢复下一条 flow。授权 URL 只保存在

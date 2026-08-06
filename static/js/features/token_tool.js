@@ -266,10 +266,12 @@ async function startOAuth() {
 }
 
 function setAutoImportButtonBusy(busy) {
-    const button = document.getElementById('startAutoImportButton');
-    if (button) {
-        button.disabled = busy;
-    }
+    ['startAutoImportButton', 'startInvalidTokenAutoImportButton'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) {
+            button.disabled = busy;
+        }
+    });
 }
 
 function renderAutoImportProgress(message = '') {
@@ -301,23 +303,32 @@ function copyAutoImportLines() {
     copyText(lines.value);
 }
 
-async function startAutoImportBatch() {
+function openAutoImportPopup() {
+    const popup = window.open('', 'outlook-oauth-auto-import', 'popup=yes,width=560,height=620');
+    if (!popup) {
+        showStatus(t('浏览器拦截了授权弹窗，请允许本站弹窗后重试'), 'error');
+        return null;
+    }
+    return popup;
+}
+
+async function startAutoImportBatch(options = {}) {
+    const loginHints = Array.isArray(options.loginHints) ? options.loginHints : [];
+    const suppliedPopup = options.popup || null;
     clearStatus();
-    if (autoImportPopup && !autoImportPopup.closed) {
+    if (autoImportPopup && !autoImportPopup.closed && autoImportPopup !== suppliedPopup) {
         showStatus(t('已有连续授权窗口在运行，请先完成或关闭它'), 'error');
         return;
     }
 
-    const count = Number(document.getElementById('autoImportCount')?.value || 0);
+    const count = loginHints.length || Number(document.getElementById('autoImportCount')?.value || 0);
     if (!Number.isInteger(count) || count < 1 || count > 500) {
         showStatus(t('本批次账号数必须是 1 到 500 之间的整数'), 'error');
         return;
     }
 
-    // 先打开空弹窗，保留用户点击带来的浏览器授权，避免异步请求后被弹窗拦截。
-    const popup = window.open('', 'outlook-oauth-auto-import', 'popup=yes,width=560,height=620');
+    const popup = suppliedPopup || openAutoImportPopup();
     if (!popup) {
-        showStatus(t('浏览器拦截了授权弹窗，请允许本站弹窗后重试'), 'error');
         return;
     }
 
@@ -333,6 +344,9 @@ async function startAutoImportBatch() {
         count,
         force_login: Boolean(document.getElementById('autoImportForceLogin')?.checked),
     };
+    if (loginHints.length) {
+        config.auto_import.login_hints = loginHints;
+    }
 
     const data = await tokenToolFetch('/api/token-tool/prepare', {
         method: 'POST',
@@ -358,8 +372,64 @@ async function startAutoImportBatch() {
     }
 
     popup.location.replace(authorizeUrl);
-    renderAutoImportProgress(t('请在弹窗中登录并授权第 1 个 Outlook 账号'));
-    showStatus(t('连续授权已开始；每次成功后会自动进入下一个账号'), 'success');
+    const loginHintMessage = loginHints.length ? t('；邮箱已预填，只需完成该账号的登录验证') : '';
+    renderAutoImportProgress(t(`请在弹窗中登录并授权第 1 个 Outlook 账号${loginHintMessage}`));
+    showStatus(t('连续授权已开始；每次成功后会自动退出当前 Microsoft 会话再进入下一个账号'), 'success');
+}
+
+async function startInvalidTokenAutoImportBatch() {
+    clearStatus();
+    if (autoImportPopup && !autoImportPopup.closed) {
+        showStatus(t('已有连续授权窗口在运行，请先完成或关闭它'), 'error');
+        return;
+    }
+
+    // 在异步读取候选列表之前先打开窗口，保留用户点击带来的弹窗授权。
+    const popup = openAutoImportPopup();
+    if (!popup) {
+        return;
+    }
+    autoImportPopup = popup;
+    autoImportResults = [];
+    autoImportExpectedCount = 0;
+    setAutoImportButtonBusy(true);
+    renderAutoImportProgress(t('正在读取失效 Token 账号列表…'));
+
+    const data = await tokenToolFetch('/api/accounts/invalid-token-candidates?limit=500');
+    if (!data.success) {
+        popup.close();
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        renderAutoImportProgress(data.error?.message || t('读取失效 Token 列表失败'));
+        showStatus(data.error?.message || t('读取失效 Token 列表失败'), 'error');
+        return;
+    }
+
+    const seen = new Set();
+    const loginHints = (data.candidates || [])
+        .map(item => String(item.account_email || '').trim())
+        .filter(email => email.includes('@'))
+        .filter(email => {
+            const normalized = email.toLowerCase();
+            if (seen.has(normalized)) return false;
+            seen.add(normalized);
+            return true;
+        });
+
+    if (!loginHints.length) {
+        popup.close();
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        renderAutoImportProgress(t('当前没有可重新授权的失效 Outlook 账号'));
+        showStatus(t('当前没有可重新授权的失效 Outlook 账号'), 'info');
+        return;
+    }
+
+    const countInput = document.getElementById('autoImportCount');
+    if (countInput) {
+        countInput.value = String(loginHints.length);
+    }
+    await startAutoImportBatch({ loginHints, popup });
 }
 
 function handleAutoImportMessage(event) {
@@ -372,6 +442,18 @@ function handleAutoImportMessage(event) {
     }
 
     const result = payload.result;
+    if (result.status === 'logout_complete') {
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        const warning = result.warning || '';
+        renderAutoImportProgress(warning || t('本批次已完成，Microsoft 登录状态已退出'));
+        showStatus(
+            warning || t(`连续授权完成，已自动导入 ${autoImportResults.filter(item => item.status === 'success').length} 个账号`),
+            warning ? 'info' : 'success',
+        );
+        return;
+    }
+
     autoImportResults.push(result);
     if (result.status === 'error') {
         autoImportPopup = null;
@@ -382,6 +464,13 @@ function handleAutoImportMessage(event) {
     }
 
     const warning = result.warning || '';
+    if (result.logout_pending) {
+        const nextMessage = result.remaining > 0
+            ? t(`第 ${result.current} 个账号已导入，正在退出当前 Microsoft 会话并进入第 ${result.current + 1} 个账号…`)
+            : t(`第 ${result.current} 个账号已导入，正在退出当前 Microsoft 会话并完成本批次…`);
+        renderAutoImportProgress(warning ? `${warning}；${nextMessage}` : nextMessage);
+        return;
+    }
     if (result.remaining > 0 && !warning) {
         renderAutoImportProgress(t(`第 ${result.current} 个账号已导入，正在退出当前 Microsoft 会话并进入第 ${result.current + 1} 个账号…`));
         return;
