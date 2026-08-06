@@ -113,7 +113,6 @@ def start_oauth_flow(
     if auto_import_context:
         # 自动导入上下文只与当前 state 绑定，不放入 URL 或浏览器存储。
         flow_data["auto_import"] = dict(auto_import_context)
-    store_oauth_flow(state, flow_data)
 
     authority = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
     params = {
@@ -132,8 +131,23 @@ def start_oauth_flow(
         params["prompt"] = "consent"
 
     authorize_url = f"{authority}/authorize?{urlencode(params)}"
+    # 连续授权在 Microsoft 注销回跳后需要恢复下一条 flow。授权 URL 只保存在
+    # 服务端 flow 中，不写入浏览器 Cookie 或注销 URL。
+    flow_data["authorize_url"] = authorize_url
+    store_oauth_flow(state, flow_data)
     logger.info("[oauth_tool] 授权 URL 已生成 (state=%s...)", state[:8])
     return authorize_url, state
+
+
+def build_logout_url(*, tenant: str, post_logout_redirect_uri: str) -> str:
+    """生成浏览器跳转用的 Microsoft 注销 URL。
+
+    注销必须由授权弹窗携带 Microsoft Cookie 完成，不能由服务器端 HTTP 请求替代。
+    这里只传已注册的回跳地址；不传 refresh token、授权码或账户中心的临时 logout_hint。
+    """
+    normalized_tenant = (tenant or "consumers").strip() or "consumers"
+    authority = f"https://login.microsoftonline.com/{normalized_tenant}/oauth2/v2.0"
+    return f"{authority}/logout?{urlencode({'post_logout_redirect_uri': post_logout_redirect_uri})}"
 
 
 def exchange_code_for_tokens(code: str, oauth_config: Dict[str, Any], verifier: str) -> Tuple[Optional[Dict[str, Any]], Any]:

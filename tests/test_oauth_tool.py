@@ -1112,6 +1112,22 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
         self.assertTrue(state)
         return state
 
+    def test_build_logout_url_uses_registered_callback_only(self):
+        from urllib.parse import parse_qs, urlparse
+
+        from outlook_web.services.oauth_tool import build_logout_url
+
+        callback_url = "https://token.example.com/token-tool/callback"
+        logout_url = build_logout_url(tenant="consumers", post_logout_redirect_uri=callback_url)
+        parsed = urlparse(logout_url)
+
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.netloc, "login.microsoftonline.com")
+        self.assertEqual(parsed.path, "/consumers/oauth2/v2.0/logout")
+        self.assertEqual(parse_qs(parsed.query), {"post_logout_redirect_uri": [callback_url]})
+        self.assertNotIn("refresh_token", logout_url)
+        self.assertNotIn("logout_hint", logout_url)
+
     @patch("outlook_web.controllers.token_tool.requests.get")
     @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
     def test_callback_auto_imports_graph_account_to_pool_and_telegram(self, mock_exchange, mock_get):
@@ -1136,6 +1152,7 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
         html = response.get_data(as_text=True)
         self.assertIn("outlook-email-plus-auto-import", html)
         self.assertIn("auto-user@outlook.com----x----auto-client-id----fresh-refresh-token", html)
+        self.assertNotIn("/oauth2/v2.0/logout", html)
 
         with self.app.app_context():
             from outlook_web.repositories import accounts as accounts_repo
@@ -1149,7 +1166,7 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
 
     @patch("outlook_web.controllers.token_tool.requests.get")
     @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
-    def test_callback_updates_existing_account_and_creates_next_flow(self, mock_exchange, mock_get):
+    def test_callback_updates_existing_account_logs_out_and_resumes_next_flow(self, mock_exchange, mock_get):
         from outlook_web.services import oauth_tool as oauth_tool_service
 
         account_id = self._insert_test_account(
@@ -1178,8 +1195,17 @@ class OAuthToolAutoImportTests(OAuthToolTestBase):
             state = self._prepare_auto_flow(client, count=2)
             response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
 
+            logout_response = client.get("/token-tool/callback")
+            consumed_response = client.get("/token-tool/callback")
+
         self.assertEqual(response.status_code, 200)
-        self.assertIn("正在打开下一账号", response.get_data(as_text=True))
+        html = response.get_data(as_text=True)
+        self.assertIn("正在退出当前 Microsoft 账号", html)
+        self.assertIn("/consumers/oauth2/v2.0/logout", html)
+        self.assertEqual(logout_response.status_code, 302)
+        self.assertIn("/consumers/oauth2/v2.0/authorize", logout_response.headers["Location"])
+        self.assertEqual(consumed_response.status_code, 200)
+        self.assertIn("回调缺少 code 或 state", consumed_response.get_data(as_text=True))
         next_flows = [
             flow
             for flow in oauth_tool_service.OAUTH_FLOW_STORE.values()

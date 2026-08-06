@@ -17,7 +17,8 @@ def create_blueprint() -> Blueprint:
     """创建 token_tool Blueprint (FD §7.1)
 
     注意: /token-tool/callback 无 @login_required —
-    它运行在 OAuth 弹窗中无法携带 Session; 安全校验通过 controller 层的 state 参数完成。
+    常规 OAuth 回调通过 controller 层的 state 参数校验，不依赖登录 Session；
+    连续授权的注销回跳仅使用同源、已签名的 Session 续接下一条已创建的 flow。
     """
     bp = Blueprint("token_tool", __name__)
 

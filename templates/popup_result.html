@@ -30,7 +30,9 @@
         {% if auto_result.warning %}
         <p class="guidance">⚠️ {{ auto_result.warning }}</p>
         {% endif %}
-        {% if next_authorize_url %}
+        {% if logout_url %}
+        <p class="guidance">正在退出当前 Microsoft 账号，然后打开下一账号登录页，请勿关闭此窗口。</p>
+        {% elif next_authorize_url %}
         <p class="guidance">正在打开下一账号的 Microsoft 登录页，请勿关闭此窗口。</p>
         {% else %}
         <p class="guidance">本批次已完成，可以关闭此窗口。</p>
@@ -67,8 +69,13 @@
             window.opener.postMessage(payload, window.location.origin);
         }
 
+        const logoutUrl = {{ logout_url | default('', true) | tojson }};
         const nextAuthorizeUrl = {{ next_authorize_url | default('', true) | tojson }};
-        if (nextAuthorizeUrl) {
+        if (logoutUrl) {
+            window.setTimeout(function () {
+                window.location.replace(logoutUrl);
+            }, 900);
+        } else if (nextAuthorizeUrl) {
             window.setTimeout(function () {
                 window.location.replace(nextAuthorizeUrl);
             }, 900);

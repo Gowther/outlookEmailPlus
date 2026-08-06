@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 import requests
-from flask import abort, jsonify, render_template, request, session
+from flask import abort, jsonify, redirect, render_template, request, session
 
 from outlook_web import config as app_config
 from outlook_web.audit import log_audit
@@ -38,6 +38,7 @@ LEGACY_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/.default"
 COMPATIBLE_SCOPE = app_config.get_oauth_scope_default()
 AUTO_IMPORT_MAX_COUNT = 500
 AUTO_IMPORT_CALLBACK_PATH = "/token-tool/callback"
+AUTO_IMPORT_LOGOUT_SESSION_KEY = "oauth_auto_logout_continue"
 GRAPH_API_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 logger = logging.getLogger(__name__)
@@ -297,6 +298,63 @@ def _render_auto_import_error(error_code: str, error_description: str, guidance:
     )
 
 
+def _resume_auto_import_after_logout(error: str = "", error_description: str = "") -> Any | None:
+    """消费一次性注销续接状态，并继续下一账号的 OAuth flow。
+
+    Microsoft 对个人账号的 post_logout_redirect_uri 不支持附加查询参数，
+    所以续接 state 保存在已签名的本站 Session，真正的授权 URL 仍留在服务端
+    OAUTH_FLOW_STORE 中。Session 丢失时不继续，避免跳转到未知 flow。
+    """
+    continuation = session.pop(AUTO_IMPORT_LOGOUT_SESSION_KEY, None)
+    if continuation is None:
+        return None
+
+    if not isinstance(continuation, dict):
+        return _render_auto_import_error(
+            "OAUTH_LOGOUT_CONTINUATION_INVALID",
+            "Microsoft 注销完成后无法恢复下一账号授权，请重新发起当前批次",
+        )
+
+    next_state = continuation.get("next_state")
+    batch_id = continuation.get("batch_id")
+    if not isinstance(next_state, str) or not next_state or not isinstance(batch_id, str) or not batch_id:
+        return _render_auto_import_error(
+            "OAUTH_LOGOUT_CONTINUATION_INVALID",
+            "Microsoft 注销续接信息无效，请重新发起当前批次",
+        )
+
+    next_flow = oauth_tool_service.get_oauth_flow(next_state)
+    next_auto_import = (next_flow or {}).get("auto_import") or {}
+    next_authorize_url = (next_flow or {}).get("authorize_url") or ""
+    is_expected_flow = (
+        isinstance(next_auto_import, dict)
+        and next_auto_import.get("batch_id") == batch_id
+        and isinstance(next_authorize_url, str)
+        and next_authorize_url.startswith("https://login.microsoftonline.com/")
+    )
+    if not is_expected_flow:
+        oauth_tool_service.discard_oauth_flow(next_state)
+        if session.get("oauth_state") == next_state:
+            session.pop("oauth_state", None)
+        return _render_auto_import_error(
+            "OAUTH_LOGOUT_CONTINUATION_EXPIRED",
+            "Microsoft 注销耗时过长或续接已过期，请重新发起当前批次",
+        )
+
+    if error:
+        oauth_tool_service.discard_oauth_flow(next_state)
+        if session.get("oauth_state") == next_state:
+            session.pop("oauth_state", None)
+        return _render_auto_import_error(
+            "OAUTH_MICROSOFT_LOGOUT_FAILED",
+            error_description or f"Microsoft 注销失败：{error}",
+            "请关闭当前弹窗后重新发起这一账号的授权",
+        )
+
+    logger.info("[oauth_tool] Microsoft 注销完成，继续下一账号授权 (state=%s...)", next_state[:8])
+    return redirect(next_authorize_url)
+
+
 def _handle_auto_import_callback(
     *,
     code: str,
@@ -343,6 +401,7 @@ def _handle_auto_import_callback(
     result.update({"status": "success", "current": current, "total": total, "remaining": remaining})
 
     next_authorize_url = ""
+    logout_url = ""
     if remaining:
         next_context = dict(auto_import)
         next_context.update({"current": current + 1, "remaining": remaining})
@@ -353,8 +412,19 @@ def _handle_auto_import_callback(
         if not next_authorize_url:
             result["warning"] = "当前账号已导入，但无法创建下一账号授权：%s" % state_or_error
         else:
-            # 仅为同源弹窗存在 Session 时更新；自动回调本身不依赖该 Cookie。
+            # 注销回跳不能携带自定义 query 参数（个人 Microsoft 账号限制），
+            # 因此只将下一 flow 的 state 放在已签名的本站 Session 中。
+            session[AUTO_IMPORT_LOGOUT_SESSION_KEY] = {
+                "batch_id": auto_import["batch_id"],
+                "next_state": state_or_error,
+            }
             session["oauth_state"] = state_or_error
+            logout_url = oauth_tool_service.build_logout_url(
+                tenant=flow_data.get("tenant", COMPATIBLE_TENANT),
+                post_logout_redirect_uri=flow_data["redirect_uri"],
+            )
+            # 下一条授权 URL 只在服务端 flow 中保存；弹窗先完成 Microsoft 注销。
+            next_authorize_url = ""
 
     return render_template(
         "popup_result.html",
@@ -362,6 +432,7 @@ def _handle_auto_import_callback(
         auto_import=True,
         auto_result=result,
         next_authorize_url=next_authorize_url,
+        logout_url=logout_url,
     )
 
 
@@ -425,7 +496,16 @@ def handle_callback() -> Any:
     _ensure_oauth_tool_enabled()
     error = request.args.get("error")
     error_description = request.args.get("error_description", "")
+    code = request.args.get("code")
     state = request.args.get("state")
+
+    # Microsoft 的注销回跳不含 OAuth code/state；优先消费一次性续接状态，
+    # 再进入通常的授权回调处理。
+    if not code and not state:
+        logout_resume = _resume_auto_import_after_logout(error or "", error_description)
+        if logout_resume is not None:
+            return logout_resume
+
     flow_data = oauth_tool_service.get_oauth_flow(state) if state else None
     auto_import = (flow_data or {}).get("auto_import")
 
@@ -444,7 +524,6 @@ def handle_callback() -> Any:
             guidance=guidance,
         )
 
-    code = request.args.get("code")
     if not code or not state:
         if auto_import:
             return _render_auto_import_error(

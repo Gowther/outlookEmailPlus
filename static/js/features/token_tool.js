@@ -383,7 +383,7 @@ function handleAutoImportMessage(event) {
 
     const warning = result.warning || '';
     if (result.remaining > 0 && !warning) {
-        renderAutoImportProgress(t(`第 ${result.current} 个账号已导入，正在进入第 ${result.current + 1} 个账号…`));
+        renderAutoImportProgress(t(`第 ${result.current} 个账号已导入，正在退出当前 Microsoft 会话并进入第 ${result.current + 1} 个账号…`));
         return;
     }
 
