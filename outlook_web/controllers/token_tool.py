@@ -10,14 +10,17 @@
 设计决策 (FD v1.0 §收口说明):
   - prepare / config / save 接口均拒绝不兼容输入 (client_secret / 非 consumers tenant)
   - save_to_account 使用 test_refresh_token_with_rotation 验证后再写入
-  - 回调页 (popup_result.html) 不直接换取 token, 统一走手动粘贴 exchange 接口
+  - 普通回调保持手动粘贴换取；带 auto_import 上下文的回调在服务端完成连续导入
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+import secrets
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
+import requests
 from flask import abort, jsonify, render_template, request, session
 
 from outlook_web import config as app_config
@@ -33,6 +36,11 @@ from outlook_web.services import oauth_tool as oauth_tool_service
 COMPATIBLE_TENANT = "consumers"
 LEGACY_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/.default"
 COMPATIBLE_SCOPE = app_config.get_oauth_scope_default()
+AUTO_IMPORT_MAX_COUNT = 500
+AUTO_IMPORT_CALLBACK_PATH = "/token-tool/callback"
+GRAPH_API_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_oauth_tool_enabled() -> None:
@@ -57,6 +65,304 @@ def _save_validation_guidance(error_msg: str) -> str | None:
     if "aadsts9002331" in detail or "/consumers endpoint" in detail:
         return "当前 Azure 应用被配置为仅 Personal Microsoft accounts，这会与系统现有的 /common 验证与运行模型冲突。请将 Supported account types 改为“Accounts in any identity provider or organizational directory and personal Microsoft accounts”。"
     return None
+
+
+def _build_oauth_config(data: Dict[str, Any], *, prompt_login: bool = False) -> Dict[str, Any]:
+    """从 API 请求构造 OAuth 配置，保证手动和自动流程使用同一套参数。"""
+    return {
+        "client_id": (data.get("client_id") or "").strip(),
+        "client_secret": "",
+        "redirect_uri": (data.get("redirect_uri") or "").strip(),
+        "scope": (data.get("scope") or "").strip(),
+        "tenant": COMPATIBLE_TENANT,
+        "prompt_consent": bool(data.get("prompt_consent")),
+        "prompt_login": prompt_login,
+    }
+
+
+def _is_graph_scope(scope: str) -> bool:
+    """判断标准化后的 scope 是否包含 Microsoft Graph API scope。"""
+    normalized_scope, scope_error = oauth_tool_service.validate_scope(scope)
+    if scope_error:
+        return False
+    return any(token.lower().startswith("https://graph.microsoft.com/") for token in normalized_scope.split())
+
+
+def _build_auto_import_context(
+    data: Dict[str, Any],
+    *,
+    redirect_uri: str,
+    scope: str,
+    request_origin: str = "",
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """校验并创建仅服务端保存的连续自动导入批次上下文。"""
+    auto_import = data.get("auto_import")
+    if not isinstance(auto_import, dict) or not auto_import.get("enabled"):
+        return None, None
+
+    try:
+        count = int(auto_import.get("count", 1))
+    except (TypeError, ValueError):
+        return None, "授权账号数量必须是 1 到 500 之间的整数"
+    if not 1 <= count <= AUTO_IMPORT_MAX_COUNT:
+        return None, f"授权账号数量必须是 1 到 {AUTO_IMPORT_MAX_COUNT} 之间的整数"
+
+    parsed_redirect_uri = urlparse(redirect_uri)
+    redirect_path = parsed_redirect_uri.path.rstrip("/") or "/"
+    if redirect_path != AUTO_IMPORT_CALLBACK_PATH:
+        return (
+            None,
+            "批量自动导入要求 Redirect URI 指向当前服务的 /token-tool/callback；"
+            "VPS 部署时请填写可从浏览器访问的公网域名，不可使用远程服务器的 localhost",
+        )
+    redirect_origin = f"{parsed_redirect_uri.scheme}://{parsed_redirect_uri.netloc}"
+    normalized_request_origin = request_origin.rstrip("/")
+    if normalized_request_origin and redirect_origin != normalized_request_origin:
+        return None, "批量自动导入的 Redirect URI 必须与当前 Token 工具页面同域，确保授权回调能回到本服务"
+    if not _is_graph_scope(scope):
+        return None, "批量自动导入仅支持 Graph 邮件，请先选择“Graph 邮件”Scope 预设"
+
+    return (
+        {
+            "batch_id": secrets.token_urlsafe(12),
+            "total": count,
+            "current": 1,
+            "remaining": count,
+            "prompt_consent": bool(data.get("prompt_consent")),
+            # 默认强制显示登录页，避免 Microsoft 复用上一个账号而重复导入。
+            "prompt_login": bool(auto_import.get("force_login", True)),
+        },
+        None,
+    )
+
+
+def _oauth_config_from_flow(flow_data: Dict[str, Any]) -> Dict[str, Any]:
+    """从已校验的 flow 恢复下一次连续授权所需的配置。"""
+    auto_import = flow_data.get("auto_import") or {}
+    return {
+        "client_id": flow_data["client_id"],
+        "client_secret": flow_data.get("client_secret", ""),
+        "redirect_uri": flow_data["redirect_uri"],
+        "scope": flow_data["scope"],
+        "tenant": flow_data.get("tenant", COMPATIBLE_TENANT),
+        "prompt_consent": bool(auto_import.get("prompt_consent")),
+        "prompt_login": bool(auto_import.get("prompt_login")),
+    }
+
+
+def _graph_response_error(response: requests.Response) -> str:
+    """返回适合展示的 Graph 错误概述，不包含请求凭据。"""
+    try:
+        payload = response.json()
+        message = (payload.get("error") or {}).get("message")
+        if message:
+            return str(message)
+    except (TypeError, ValueError):
+        pass
+    return response.reason or "未知错误"
+
+
+def _verify_graph_mailbox_and_get_email(access_token: str) -> tuple[Optional[str], Optional[str]]:
+    """使用刚换取的 access token 识别邮箱并验证具备读取收件箱的权限。"""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        profile_response = requests.get(
+            f"{GRAPH_API_BASE_URL}/me",
+            headers=headers,
+            params={"$select": "mail,userPrincipalName"},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.warning("[oauth_tool] 自动导入读取 Graph 用户信息失败: %s", exc)
+        return None, "无法连接 Graph 以识别邮箱，请检查网络后重试"
+
+    if profile_response.status_code != 200:
+        return (
+            None,
+            "无法读取 Graph 用户信息（HTTP %s）：%s。请确认应用已授予 User.Read 委托权限。"
+            % (profile_response.status_code, _graph_response_error(profile_response)),
+        )
+
+    try:
+        profile = profile_response.json()
+    except ValueError:
+        return None, "Graph 用户信息响应格式异常，请重试"
+    email = str(profile.get("mail") or profile.get("userPrincipalName") or "").strip().lower()
+    if not email or "@" not in email:
+        return None, "Graph 未返回可用邮箱地址，请确认应用已授予 User.Read 委托权限"
+
+    try:
+        mailbox_response = requests.get(
+            f"{GRAPH_API_BASE_URL}/me/mailFolders/inbox/messages",
+            headers=headers,
+            params={"$top": "1", "$select": "id"},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.warning("[oauth_tool] 自动导入验证 Graph 邮箱失败: %s", exc)
+        return None, "无法连接 Graph 以验证邮箱权限，请检查网络后重试"
+
+    if mailbox_response.status_code != 200:
+        return (
+            None,
+            "Graph 邮箱读取校验失败（HTTP %s）：%s。请确认应用已授予 Mail.Read 委托权限。"
+            % (mailbox_response.status_code, _graph_response_error(mailbox_response)),
+        )
+    return email, None
+
+
+def _auto_import_account(
+    email: str,
+    client_id: str,
+    refresh_token: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """创建或更新 Outlook 账号，并固定加入邮箱池、开启 Telegram 推送。"""
+    existing = accounts_repo.get_account_by_email(email)
+    if existing and (existing.get("account_type") or "outlook").strip().lower() != "outlook":
+        return None, "同邮箱已存在非 Outlook 类型账号，为避免覆盖，未自动写入"
+
+    if existing:
+        account_id = existing["id"]
+        success = accounts_repo.update_account_credentials(
+            account_id,
+            client_id=client_id,
+            refresh_token=refresh_token,
+            pool_status="available",
+        )
+        if not success:
+            return None, "更新已有账号凭据失败"
+        success = accounts_repo.update_account(
+            account_id=account_id,
+            email_addr=existing["email"],
+            password=None,
+            client_id=client_id,
+            refresh_token=refresh_token,
+            group_id=existing.get("group_id") or 1,
+            remark=existing.get("remark") or "",
+            status="active",
+        )
+        if not success:
+            return None, "更新已有账号状态失败"
+        action = "updated"
+    else:
+        success = accounts_repo.add_account(
+            email_addr=email,
+            password="",
+            client_id=client_id,
+            refresh_token=refresh_token,
+            account_type="outlook",
+            provider="outlook",
+            add_to_pool=True,
+        )
+        if not success:
+            return None, "创建 Outlook 账号失败（邮箱可能已存在）"
+        created = accounts_repo.get_account_by_email(email)
+        if not created:
+            return None, "账号已创建但无法读取账号信息"
+        account_id = created["id"]
+        action = "created"
+
+    telegram_enabled = accounts_repo.toggle_telegram_push(account_id, True)
+    result = {
+        "account_id": account_id,
+        "email": email,
+        "action": action,
+        "pool_added": True,
+        "telegram_enabled": bool(telegram_enabled),
+        # 仅通过同源 popup postMessage 返回给发起页面，不写入日志或数据库。
+        "import_line": f"{email}----x----{client_id}----{refresh_token}",
+    }
+    if not telegram_enabled:
+        result["warning"] = "账号已导入邮箱池，但 Telegram 开关开启失败，请在账号列表中手动开启"
+
+    log_audit(
+        "update" if action == "updated" else "create",
+        "account",
+        str(account_id),
+        f"OAuth 批量自动导入 (client_id={client_id[:8]}...)",
+    )
+    return result, None
+
+
+def _render_auto_import_error(error_code: str, error_description: str, guidance: str = "") -> Any:
+    """自动导入失败时通知发起页面；不继续下一账号，避免静默跳过。"""
+    return render_template(
+        "popup_result.html",
+        error=True,
+        error_code=error_code,
+        error_description=error_description,
+        guidance=guidance,
+        auto_import=True,
+        auto_result={"status": "error", "message": error_description},
+    )
+
+
+def _handle_auto_import_callback(
+    *,
+    code: str,
+    state: str,
+    flow_data: Dict[str, Any],
+    auto_import: Dict[str, Any],
+) -> Any:
+    """完成一次自动导入，并在成功时创建下一个账号的授权 flow。"""
+    token_data, error_info = oauth_tool_service.exchange_code_for_tokens(
+        code=code,
+        oauth_config=_oauth_config_from_flow(flow_data),
+        verifier=flow_data["verifier"],
+    )
+    # 授权码无论成功或失败都只能使用一次。
+    oauth_tool_service.discard_oauth_flow(state)
+    if session.get("oauth_state") == state:
+        session.pop("oauth_state", None)
+
+    if token_data is None:
+        if isinstance(error_info, dict):
+            return _render_auto_import_error(
+                "OAUTH_MICROSOFT_REQUEST_FAILED",
+                error_info.get("message", "换取 Token 失败"),
+                error_info.get("guidance", ""),
+            )
+        return _render_auto_import_error("OAUTH_MICROSOFT_REQUEST_FAILED", str(error_info))
+
+    refresh_token = (token_data.get("refresh_token") or "").strip()
+    access_token = (token_data.get("access_token") or "").strip()
+    if not refresh_token or not access_token:
+        return _render_auto_import_error("OAUTH_TOKEN_MISSING", "Microsoft 未返回完整的 access_token 或 refresh_token")
+
+    email, graph_error = _verify_graph_mailbox_and_get_email(access_token)
+    if graph_error:
+        return _render_auto_import_error("GRAPH_TOKEN_FAILED", graph_error)
+
+    result, import_error = _auto_import_account(email, flow_data["client_id"], refresh_token)
+    if import_error:
+        return _render_auto_import_error("ACCOUNT_IMPORT_FAILED", import_error)
+
+    current = int(auto_import.get("current", 1))
+    total = int(auto_import.get("total", current))
+    remaining = max(int(auto_import.get("remaining", 1)) - 1, 0)
+    result.update({"status": "success", "current": current, "total": total, "remaining": remaining})
+
+    next_authorize_url = ""
+    if remaining:
+        next_context = dict(auto_import)
+        next_context.update({"current": current + 1, "remaining": remaining})
+        next_authorize_url, state_or_error = oauth_tool_service.start_oauth_flow(
+            _oauth_config_from_flow(flow_data),
+            auto_import_context=next_context,
+        )
+        if not next_authorize_url:
+            result["warning"] = "当前账号已导入，但无法创建下一账号授权：%s" % state_or_error
+        else:
+            # 仅为同源弹窗存在 Session 时更新；自动回调本身不依赖该 Cookie。
+            session["oauth_state"] = state_or_error
+
+    return render_template(
+        "popup_result.html",
+        error=False,
+        auto_import=True,
+        auto_result=result,
+        next_authorize_url=next_authorize_url,
+    )
 
 
 @login_required
@@ -84,30 +390,52 @@ def prepare_oauth() -> Any:
     if compatibility_error:
         return build_error_response("OAUTH_CONFIG_INVALID", compatibility_error, status=400)
 
-    oauth_config = {
-        "client_id": client_id,
-        "client_secret": "",
-        "redirect_uri": redirect_uri,
-        "scope": (data.get("scope") or "").strip(),
-        "tenant": COMPATIBLE_TENANT,
-        "prompt_consent": bool(data.get("prompt_consent")),
-    }
+    auto_import_context, auto_import_error = _build_auto_import_context(
+        data,
+        redirect_uri=redirect_uri,
+        scope=(data.get("scope") or "").strip(),
+        request_origin=request.headers.get("Origin", ""),
+    )
+    if auto_import_error:
+        return build_error_response("OAUTH_CONFIG_INVALID", auto_import_error, status=400)
 
-    authorize_url, state_or_error = oauth_tool_service.start_oauth_flow(oauth_config)
+    oauth_config = _build_oauth_config(
+        data,
+        prompt_login=bool(auto_import_context and auto_import_context.get("prompt_login")),
+    )
+
+    authorize_url, state_or_error = oauth_tool_service.start_oauth_flow(
+        oauth_config,
+        auto_import_context=auto_import_context,
+    )
     if authorize_url is None:
         return build_error_response("OAUTH_CONFIG_INVALID", state_or_error, status=400)
 
     session["oauth_state"] = state_or_error
-    return jsonify({"success": True, "data": {"authorize_url": authorize_url}})
+    response_data = {"authorize_url": authorize_url}
+    if auto_import_context:
+        response_data["auto_import"] = {
+            "total": auto_import_context["total"],
+            "batch_id": auto_import_context["batch_id"],
+        }
+    return jsonify({"success": True, "data": response_data})
 
 
 def handle_callback() -> Any:
     _ensure_oauth_tool_enabled()
     error = request.args.get("error")
     error_description = request.args.get("error_description", "")
+    state = request.args.get("state")
+    flow_data = oauth_tool_service.get_oauth_flow(state) if state else None
+    auto_import = (flow_data or {}).get("auto_import")
 
     if error:
         guidance = oauth_tool_service.map_error_guidance(error)
+        if auto_import:
+            oauth_tool_service.discard_oauth_flow(state)
+            if session.get("oauth_state") == state:
+                session.pop("oauth_state", None)
+            return _render_auto_import_error(error, error_description, guidance)
         return render_template(
             "popup_result.html",
             error=True,
@@ -117,14 +445,27 @@ def handle_callback() -> Any:
         )
 
     code = request.args.get("code")
-    state = request.args.get("state")
     if not code or not state:
+        if auto_import:
+            return _render_auto_import_error(
+                "missing_params",
+                "回调缺少 code 或 state 参数",
+                "请关闭当前弹窗后重新发起这一账号的授权",
+            )
         return render_template(
             "popup_result.html",
             error=True,
             error_code="missing_params",
             error_description="回调缺少 code 或 state 参数",
             guidance="请重新点击『登录 Microsoft』",
+        )
+
+    if auto_import:
+        return _handle_auto_import_callback(
+            code=code,
+            state=state,
+            flow_data=flow_data,
+            auto_import=auto_import,
         )
 
     return render_template("popup_result.html", error=False)

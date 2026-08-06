@@ -13,7 +13,32 @@
     </style>
 </head>
 <body>
-    {% if error %}
+    {% if auto_import %}
+    <div class="card">
+        {% if error %}
+        <h2>⚠️ 自动导入未完成</h2>
+        <p><strong>{{ error_code }}</strong></p>
+        <p>{{ error_description }}</p>
+        {% if guidance %}<p class="guidance">💡 {{ guidance }}</p>{% endif %}
+        <p class="guidance">当前账号未跳过。请关闭此窗口，在主页面确认错误后重新发起授权。</p>
+        {% else %}
+        <h2>✅ 已自动导入</h2>
+        <p>{{ auto_result.email }} 已{{ "更新" if auto_result.action == "updated" else "导入" }}到邮箱池。</p>
+        {% if auto_result.telegram_enabled %}
+        <p class="guidance">Telegram 推送已开启。</p>
+        {% endif %}
+        {% if auto_result.warning %}
+        <p class="guidance">⚠️ {{ auto_result.warning }}</p>
+        {% endif %}
+        {% if next_authorize_url %}
+        <p class="guidance">正在打开下一账号的 Microsoft 登录页，请勿关闭此窗口。</p>
+        {% else %}
+        <p class="guidance">本批次已完成，可以关闭此窗口。</p>
+        {% endif %}
+        {% endif %}
+        <button class="btn btn-secondary" onclick="window.close()">关闭</button>
+    </div>
+    {% elif error %}
     <div class="card">
         <h2>⚠️ 授权未完成</h2>
         <p><strong>{{ error_code }}</strong></p>
@@ -32,6 +57,25 @@
     {% endif %}
 
     <script>
+    {% if auto_import %}
+    (function () {
+        const payload = {
+            source: 'outlook-email-plus-auto-import',
+            result: {{ auto_result | tojson }},
+        };
+        if (window.opener && !window.opener.closed) {
+            window.opener.postMessage(payload, window.location.origin);
+        }
+
+        const nextAuthorizeUrl = {{ next_authorize_url | default('', true) | tojson }};
+        if (nextAuthorizeUrl) {
+            window.setTimeout(function () {
+                window.location.replace(nextAuthorizeUrl);
+            }, 900);
+        }
+    }());
+    {% endif %}
+
     function copyCurrentUrl() {
         navigator.clipboard.writeText(window.location.href).then(function() {
             document.getElementById('copy-tip').style.display = 'block';

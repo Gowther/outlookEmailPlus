@@ -107,6 +107,44 @@
     margin-top: 16px;
 }
 
+.auto-import-card {
+    border-color: rgba(0, 120, 212, 0.38);
+}
+
+.auto-import-login-option {
+    align-self: end;
+    min-height: 40px;
+}
+
+.auto-import-fixed-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    color: var(--text-secondary);
+    font-size: 0.84rem;
+}
+
+.auto-import-actions {
+    margin-top: 16px;
+}
+
+.auto-import-progress {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-light);
+}
+
+.auto-import-progress-text {
+    margin-bottom: 12px;
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    font-weight: 600;
+}
+
+.auto-import-lines {
+    min-height: 130px;
+}
+
 .scope-editor {
     display: flex;
     flex-direction: column;
@@ -367,9 +405,14 @@
     .token-tool-header,
     .token-action-row,
     .scope-entry-row,
-    .token-button-row {
+    .token-button-row,
+    .auto-import-fixed-options {
         flex-direction: column;
         align-items: stretch;
+    }
+
+    .auto-import-login-option {
+        align-self: stretch;
     }
 
     .token-form-grid,

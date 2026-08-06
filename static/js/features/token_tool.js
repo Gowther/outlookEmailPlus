@@ -18,6 +18,9 @@ const DEFAULT_COMPAT_SCOPE = SCOPE_PRESETS.graph.join(' ');
 
 let scopeTokens = ['offline_access', 'https://graph.microsoft.com/.default'];
 let currentTokenResult = null;
+let autoImportResults = [];
+let autoImportExpectedCount = 0;
+let autoImportPopup = null;
 
 async function tokenToolFetch(url, options = {}) {
     const headers = {
@@ -262,6 +265,137 @@ async function startOAuth() {
     showStatus(t('授权链接已生成，请复制并在浏览器中打开'), 'success');
 }
 
+function setAutoImportButtonBusy(busy) {
+    const button = document.getElementById('startAutoImportButton');
+    if (button) {
+        button.disabled = busy;
+    }
+}
+
+function renderAutoImportProgress(message = '') {
+    const progress = document.getElementById('autoImportProgress');
+    const progressText = document.getElementById('autoImportProgressText');
+    const lines = document.getElementById('autoImportLines');
+    if (!progress || !progressText || !lines) {
+        return;
+    }
+
+    progress.classList.remove('hidden');
+    const succeeded = autoImportResults.filter(result => result.status === 'success').length;
+    const failed = autoImportResults.filter(result => result.status === 'error').length;
+    const total = autoImportExpectedCount || 0;
+    const summary = `已完成 ${succeeded}/${total} 个账号${failed ? `，失败 ${failed} 个` : ''}`;
+    progressText.textContent = message ? `${summary}：${message}` : summary;
+    lines.value = autoImportResults
+        .filter(result => result.status === 'success' && result.import_line)
+        .map(result => result.import_line)
+        .join('\n');
+}
+
+function copyAutoImportLines() {
+    const lines = document.getElementById('autoImportLines');
+    if (!lines?.value) {
+        showStatus(t('当前没有可复制的导入行'), 'error');
+        return;
+    }
+    copyText(lines.value);
+}
+
+async function startAutoImportBatch() {
+    clearStatus();
+    if (autoImportPopup && !autoImportPopup.closed) {
+        showStatus(t('已有连续授权窗口在运行，请先完成或关闭它'), 'error');
+        return;
+    }
+
+    const count = Number(document.getElementById('autoImportCount')?.value || 0);
+    if (!Number.isInteger(count) || count < 1 || count > 500) {
+        showStatus(t('本批次账号数必须是 1 到 500 之间的整数'), 'error');
+        return;
+    }
+
+    // 先打开空弹窗，保留用户点击带来的浏览器授权，避免异步请求后被弹窗拦截。
+    const popup = window.open('', 'outlook-oauth-auto-import', 'popup=yes,width=560,height=620');
+    if (!popup) {
+        showStatus(t('浏览器拦截了授权弹窗，请允许本站弹窗后重试'), 'error');
+        return;
+    }
+
+    autoImportResults = [];
+    autoImportExpectedCount = count;
+    autoImportPopup = popup;
+    setAutoImportButtonBusy(true);
+    renderAutoImportProgress(t('正在创建第一条授权请求…'));
+
+    const config = collectFormConfig();
+    config.auto_import = {
+        enabled: true,
+        count,
+        force_login: Boolean(document.getElementById('autoImportForceLogin')?.checked),
+    };
+
+    const data = await tokenToolFetch('/api/token-tool/prepare', {
+        method: 'POST',
+        body: JSON.stringify(config),
+    });
+    if (!data.success) {
+        popup.close();
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        renderAutoImportProgress(data.error?.message || t('创建连续授权失败'));
+        showStatus(data.error?.message || t('创建连续授权失败'), 'error', data.error?.details || '');
+        return;
+    }
+
+    const authorizeUrl = data.data?.authorize_url;
+    if (!authorizeUrl) {
+        popup.close();
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        renderAutoImportProgress(t('授权地址为空'));
+        showStatus(t('授权地址为空'), 'error');
+        return;
+    }
+
+    popup.location.replace(authorizeUrl);
+    renderAutoImportProgress(t('请在弹窗中登录并授权第 1 个 Outlook 账号'));
+    showStatus(t('连续授权已开始；每次成功后会自动进入下一个账号'), 'success');
+}
+
+function handleAutoImportMessage(event) {
+    if (event.origin !== window.location.origin) {
+        return;
+    }
+    const payload = event.data || {};
+    if (payload.source !== 'outlook-email-plus-auto-import' || !payload.result) {
+        return;
+    }
+
+    const result = payload.result;
+    autoImportResults.push(result);
+    if (result.status === 'error') {
+        autoImportPopup = null;
+        setAutoImportButtonBusy(false);
+        renderAutoImportProgress(result.message || t('当前账号自动导入失败'));
+        showStatus(result.message || t('当前账号自动导入失败'), 'error');
+        return;
+    }
+
+    const warning = result.warning || '';
+    if (result.remaining > 0 && !warning) {
+        renderAutoImportProgress(t(`第 ${result.current} 个账号已导入，正在进入第 ${result.current + 1} 个账号…`));
+        return;
+    }
+
+    autoImportPopup = null;
+    setAutoImportButtonBusy(false);
+    renderAutoImportProgress(warning || t('本批次已完成'));
+    showStatus(
+        warning || t(`连续授权完成，已自动导入 ${autoImportResults.filter(item => item.status === 'success').length} 个账号`),
+        warning ? 'info' : 'success',
+    );
+}
+
 function copyAuthorizeLink() {
     const linkInput = document.getElementById('authorizeUrl');
     if (!linkInput || !linkInput.value) {
@@ -466,6 +600,7 @@ async function confirmSaveToAccount() {
 
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scopeChips')?.addEventListener('click', handleScopeChipClick);
+    window.addEventListener('message', handleAutoImportMessage);
     document.getElementById('redirectUri').value = buildDefaultRedirectUri();
     renderScopeChips(SCOPE_PRESETS.graph.join(' '));
     loadOAuthConfig();

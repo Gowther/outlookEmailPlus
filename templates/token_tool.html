@@ -72,6 +72,7 @@
                             <li>本地部署：<code>http://localhost:5001/token-tool/callback</code>（端口号根据实际调整）</li>
                             <li>Docker/远程部署：可填 <code>http://localhost</code>，授权后手动复制地址栏 URL 粘贴回本工具</li>
                         </ul>
+                        <p class="token-field-hint">💡 使用下方“批量自动导入”时，必须填写当前服务可从浏览器访问的公网回调地址（例如 <code>https://你的域名/token-tool/callback</code>）；远程 VPS 的 <code>localhost</code> 仅适用于手动复制回调 URL。</p>
                     </div>
                 </div>
 
@@ -133,8 +134,45 @@
             </div>
         </section>
 
+        <section class="token-card auto-import-card">
+            <div class="token-card-title">② 批量授权并自动导入</div>
+            <p class="token-field-hint">每个账号仍由你在 Microsoft 页面登录、授权；成功回调后系统会自动换取并校验 Graph Token、创建或更新 Outlook 账号、加入邮箱池、开启 Telegram 推送，然后弹窗自动进入下一个账号。</p>
+            <div class="token-form-grid">
+                <label class="token-field">
+                    <span>本批次账号数</span>
+                    <input id="autoImportCount" type="number" class="form-input" min="1" max="500" value="1">
+                </label>
+                <label class="checkbox-inline auto-import-login-option">
+                    <input id="autoImportForceLogin" type="checkbox" checked>
+                    <span>每个账号显示 Microsoft 登录页（避免重复使用上一个账号）</span>
+                </label>
+                <div class="token-field token-field-full">
+                    <span>自动处理项</span>
+                    <div class="auto-import-fixed-options">
+                        <span>✓ 自动创建或更新同邮箱 Outlook 账号</span>
+                        <span>✓ 加入邮箱池</span>
+                        <span>✓ 开启 Telegram 推送</span>
+                    </div>
+                    <small class="token-field-hint">请先选择上方“Graph 邮件”Scope 预设，并确保 Redirect URI 是本服务的 <code>/token-tool/callback</code>。</small>
+                </div>
+            </div>
+            <div class="token-button-row auto-import-actions">
+                <button id="startAutoImportButton" type="button" class="btn-inline primary" onclick="startAutoImportBatch()">开始连续授权并自动导入</button>
+            </div>
+            <div id="autoImportProgress" class="auto-import-progress hidden" aria-live="polite">
+                <div id="autoImportProgressText" class="auto-import-progress-text"></div>
+                <label class="token-field token-field-full">
+                    <span>已生成的导入行（仅保存在当前浏览器页面，可直接复制备用）</span>
+                    <textarea id="autoImportLines" class="form-input token-textarea auto-import-lines" readonly></textarea>
+                </label>
+                <div class="token-button-row">
+                    <button type="button" class="btn-inline" onclick="copyAutoImportLines()">复制全部导入行</button>
+                </div>
+            </div>
+        </section>
+
         <section id="authorize-link-panel" class="token-card hidden">
-            <div class="token-card-title">② 授权链接</div>
+            <div class="token-card-title">③ 手动授权链接（可选）</div>
             <div class="token-field token-field-full">
                 <span>请在浏览器中打开以下链接完成授权</span>
                 <div class="authorize-link-row">
@@ -147,7 +185,7 @@
         </section>
 
         <details id="manual-exchange" class="token-card token-details">
-            <summary>③ 换取 Token</summary>
+            <summary>④ 手动换取 Token（可选）</summary>
             <div class="token-details-body">
                 <label class="token-field token-field-full">
                     <span>回调 URL</span>
@@ -160,7 +198,7 @@
         </details>
 
         <section id="result-panel" class="token-card hidden">
-            <div class="token-card-title">④ 结果</div>
+            <div class="token-card-title">⑤ 手动 Token 结果</div>
             <div id="resultSuccessBanner" class="token-success-banner hidden">✅ Token 获取成功</div>
             <div class="result-grid">
                 <div class="result-item result-item-full">

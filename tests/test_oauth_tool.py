@@ -1081,6 +1081,191 @@ class OAuthToolApiSaveTests(OAuthToolTestBase):
             self.assertEqual(resp.status_code, 401)
 
 
+class OAuthToolAutoImportTests(OAuthToolTestBase):
+    """连续授权回调应只在 Graph 校验成功后自动写入账号。"""
+
+    @staticmethod
+    def _graph_response(status_code, payload, reason="Graph error"):
+        response = MagicMock()
+        response.status_code = status_code
+        response.json.return_value = payload
+        response.reason = reason
+        return response
+
+    def _prepare_auto_flow(self, client, *, count=1, **overrides):
+        from urllib.parse import parse_qs, urlparse
+
+        payload = {
+            "client_id": "auto-client-id",
+            "tenant": "consumers",
+            "scope": "offline_access https://graph.microsoft.com/.default",
+            "redirect_uri": "http://localhost:5000/token-tool/callback",
+            "auto_import": {"enabled": True, "count": count, "force_login": True},
+            **overrides,
+        }
+        response = client.post("/api/token-tool/prepare", json=payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data.get("success"))
+        authorize_url = data.get("data", {}).get("authorize_url", "")
+        state = parse_qs(urlparse(authorize_url).query).get("state", [""])[0]
+        self.assertTrue(state)
+        return state
+
+    @patch("outlook_web.controllers.token_tool.requests.get")
+    @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
+    def test_callback_auto_imports_graph_account_to_pool_and_telegram(self, mock_exchange, mock_get):
+        mock_exchange.return_value = (
+            {
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+            },
+            None,
+        )
+        mock_get.side_effect = [
+            self._graph_response(200, {"mail": "Auto-User@outlook.com"}),
+            self._graph_response(200, {"value": []}),
+        ]
+
+        with self.app.test_client() as client:
+            self._login(client)
+            state = self._prepare_auto_flow(client)
+            response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("outlook-email-plus-auto-import", html)
+        self.assertIn("auto-user@outlook.com----x----auto-client-id----fresh-refresh-token", html)
+
+        with self.app.app_context():
+            from outlook_web.repositories import accounts as accounts_repo
+
+            account = accounts_repo.get_account_by_email("auto-user@outlook.com")
+            self.assertIsNotNone(account)
+            self.assertEqual(account["client_id"], "auto-client-id")
+            self.assertEqual(account["refresh_token"], "fresh-refresh-token")
+            self.assertEqual(account["pool_status"], "available")
+            self.assertTrue(account["telegram_push_enabled"])
+
+    @patch("outlook_web.controllers.token_tool.requests.get")
+    @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
+    def test_callback_updates_existing_account_and_creates_next_flow(self, mock_exchange, mock_get):
+        from outlook_web.services import oauth_tool as oauth_tool_service
+
+        account_id = self._insert_test_account(
+            email="existing@outlook.com",
+            client_id="old-client-id",
+            refresh_token="old-refresh-token",
+        )
+        with self.app.app_context():
+            from outlook_web.db import get_db
+
+            db = get_db()
+            db.execute("UPDATE accounts SET status = 'inactive' WHERE id = ?", (account_id,))
+            db.commit()
+
+        mock_exchange.return_value = (
+            {"access_token": "fresh-access-token", "refresh_token": "fresh-refresh-token"},
+            None,
+        )
+        mock_get.side_effect = [
+            self._graph_response(200, {"userPrincipalName": "existing@outlook.com"}),
+            self._graph_response(200, {"value": []}),
+        ]
+
+        with self.app.test_client() as client:
+            self._login(client)
+            state = self._prepare_auto_flow(client, count=2)
+            response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("正在打开下一账号", response.get_data(as_text=True))
+        next_flows = [
+            flow
+            for flow in oauth_tool_service.OAUTH_FLOW_STORE.values()
+            if flow.get("auto_import", {}).get("batch_id")
+        ]
+        self.assertEqual(len(next_flows), 1)
+        self.assertEqual(next_flows[0]["auto_import"]["current"], 2)
+        self.assertEqual(next_flows[0]["auto_import"]["remaining"], 1)
+
+        with self.app.app_context():
+            from outlook_web.repositories import accounts as accounts_repo
+
+            account = accounts_repo.get_account_by_id(account_id)
+            self.assertEqual(account["client_id"], "auto-client-id")
+            self.assertEqual(account["refresh_token"], "fresh-refresh-token")
+            self.assertEqual(account["pool_status"], "available")
+            self.assertEqual(account["status"], "active")
+
+    @patch("outlook_web.controllers.token_tool.requests.get")
+    @patch("outlook_web.controllers.token_tool.oauth_tool_service.exchange_code_for_tokens")
+    def test_callback_does_not_import_when_graph_mailbox_validation_fails(self, mock_exchange, mock_get):
+        mock_exchange.return_value = (
+            {"access_token": "fresh-access-token", "refresh_token": "fresh-refresh-token"},
+            None,
+        )
+        mock_get.side_effect = [
+            self._graph_response(200, {"mail": "no-mail-read@outlook.com"}),
+            self._graph_response(403, {"error": {"message": "Access is denied."}}, "Forbidden"),
+        ]
+
+        with self.app.test_client() as client:
+            self._login(client)
+            state = self._prepare_auto_flow(client)
+            response = client.get(f"/token-tool/callback?code=auto-code&state={state}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("GRAPH_TOKEN_FAILED", response.get_data(as_text=True))
+        with self.app.app_context():
+            from outlook_web.repositories import accounts as accounts_repo
+
+            self.assertIsNone(accounts_repo.get_account_by_email("no-mail-read@outlook.com"))
+
+    def test_auto_import_rejects_imap_scope_or_non_callback_redirect_uri(self):
+        with self.app.test_client() as client:
+            self._login(client)
+            imap_response = client.post(
+                "/api/token-tool/prepare",
+                json={
+                    "client_id": "auto-client-id",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+                    "redirect_uri": "http://localhost:5000/token-tool/callback",
+                    "auto_import": {"enabled": True, "count": 1},
+                },
+            )
+            self.assertEqual(imap_response.status_code, 400)
+            self.assertIn("仅支持 Graph", imap_response.get_json().get("message", ""))
+
+            callback_response = client.post(
+                "/api/token-tool/prepare",
+                json={
+                    "client_id": "auto-client-id",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://graph.microsoft.com/.default",
+                    "redirect_uri": "http://localhost:5000/other-callback",
+                    "auto_import": {"enabled": True, "count": 1},
+                },
+            )
+            self.assertEqual(callback_response.status_code, 400)
+            self.assertIn("/token-tool/callback", callback_response.get_json().get("message", ""))
+
+            origin_response = client.post(
+                "/api/token-tool/prepare",
+                headers={"Origin": "https://token.example.com"},
+                json={
+                    "client_id": "auto-client-id",
+                    "tenant": "consumers",
+                    "scope": "offline_access https://graph.microsoft.com/.default",
+                    "redirect_uri": "https://other.example.com/token-tool/callback",
+                    "auto_import": {"enabled": True, "count": 1},
+                },
+            )
+            self.assertEqual(origin_response.status_code, 400)
+            self.assertIn("同域", origin_response.get_json().get("message", ""))
+
+
 class OAuthToolApiBlueprintTests(OAuthToolTestBase):
     def test_token_tool_page_accessible_when_enabled(self):
         with self.app.test_client() as client:

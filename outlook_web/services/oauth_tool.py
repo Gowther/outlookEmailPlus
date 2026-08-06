@@ -82,7 +82,11 @@ def generate_pkce() -> Tuple[str, str]:
     return verifier, challenge
 
 
-def start_oauth_flow(oauth_config: Dict[str, Any]) -> Tuple[Optional[str], str]:
+def start_oauth_flow(
+    oauth_config: Dict[str, Any],
+    *,
+    auto_import_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], str]:
     """
     生成 Microsoft OAuth 授权 URL
 
@@ -98,17 +102,18 @@ def start_oauth_flow(oauth_config: Dict[str, Any]) -> Tuple[Optional[str], str]:
     state = secrets.token_urlsafe(24)
 
     tenant = (oauth_config.get("tenant") or "consumers").strip()
-    store_oauth_flow(
-        state,
-        {
-            "client_id": oauth_config["client_id"],
-            "client_secret": oauth_config.get("client_secret", ""),
-            "redirect_uri": oauth_config["redirect_uri"],
-            "scope": normalized_scope,
-            "tenant": tenant,
-            "verifier": verifier,
-        },
-    )
+    flow_data = {
+        "client_id": oauth_config["client_id"],
+        "client_secret": oauth_config.get("client_secret", ""),
+        "redirect_uri": oauth_config["redirect_uri"],
+        "scope": normalized_scope,
+        "tenant": tenant,
+        "verifier": verifier,
+    }
+    if auto_import_context:
+        # 自动导入上下文只与当前 state 绑定，不放入 URL 或浏览器存储。
+        flow_data["auto_import"] = dict(auto_import_context)
+    store_oauth_flow(state, flow_data)
 
     authority = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
     params = {
@@ -121,7 +126,9 @@ def start_oauth_flow(oauth_config: Dict[str, Any]) -> Tuple[Optional[str], str]:
         "code_challenge_method": "S256",
         "state": state,
     }
-    if oauth_config.get("prompt_consent"):
+    if oauth_config.get("prompt_login"):
+        params["prompt"] = "login"
+    elif oauth_config.get("prompt_consent"):
         params["prompt"] = "consent"
 
     authorize_url = f"{authority}/authorize?{urlencode(params)}"
