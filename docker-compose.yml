@@ -2,30 +2,23 @@ services:
   app:
     # 模式一（默认）：直接拉取远端镜像（适合大多数用户）
     # 镜像标签可通过 .env 的 IMAGE_TAG 控制（默认 latest）
-    # ---------- 新前端（Ant Design Pro SPA，默认） ----------
-    image: ghcr.io/zeropointsix/outlook-email-plus:${IMAGE_TAG:-latest}
-    # Docker Hub 备选：
+    # GHCR 镜像（国内网络推荐，访问更稳定）：
+    #image: ghcr.io/zeropointsix/outlook-email-plus:${IMAGE_TAG:-latest}
+    # Docker Hub 镜像（如需切换取消注释，并注释上行）：
     # image: guangshanshui/outlook-email-plus:${IMAGE_TAG:-latest}
-    # ---------- 旧前端（legacy，需旧界面时切换） ----------
-    # 固定版本示例：IMAGE_TAG=v2.9.10-legacy
-    # image: ghcr.io/zeropointsix/outlook-email-plus-legacy:${IMAGE_TAG:-latest-legacy}
-    # image: guangshanshui/outlook-email-plus-legacy:${IMAGE_TAG:-latest-legacy}
 
     # 模式二（开发者）：本地构建（取消注释 build，并按需注释 image）
-    # 新前端：
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    # 旧前端：
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile.legacy
+    build:
+      context: .
+      dockerfile: Dockerfile
 
     container_name: outlook-email-plus
 
     # 主机侧端口（默认 5001，避免与本机 5000 冲突）
     ports:
       - "${APP_PORT:-5001}:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # 从 .env 注入所有环境变量（避免在 compose 里硬编码）
     env_file:
@@ -52,9 +45,8 @@ services:
       DOCKER_SELF_UPDATE_ALLOW: "${DOCKER_SELF_UPDATE_ALLOW:-false}"
 
     volumes:
-      - ./data:/app/data
-      - ./.runtime:/app/.runtime
-      - ./plugins:/app/plugins
+      - /data/app_data/outlookEmailPlus/data:/app/data
+      - /data/app_data/outlookEmailPlus/.runtime:/app/.runtime
       # Docker socket 挂载（可选，仅用于 Docker API 自更新功能）
       # ⚠️ 警告：挂载 docker.sock 会授予容器完全的 Docker API 访问权限，请谨慎使用
       # - /var/run/docker.sock:/var/run/docker.sock
@@ -87,24 +79,24 @@ services:
     networks:
       - outlook-net
 
-  watchtower:
-    image: containrrr/watchtower:1.7.1
-    container_name: watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      # 与上方 app 服务的 WATCHTOWER_HTTP_API_TOKEN 保持一致；留空均使用同一内置默认值
-      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-outlook-mail-plus-watchtower-default}
-      - WATCHTOWER_HTTP_API_UPDATE=true
-      - WATCHTOWER_CLEANUP=true
-      # 禁用定时轮询，仅通过界面触发更新
-      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
-    command: --http-api-update --label-enable
-    labels:
-      - "com.centurylinklabs.watchtower.enable=false"
-    networks:
-      - outlook-net
+ #watchtower:
+ #  image: nickfedor/watchtower
+ #  container_name: watchtower
+ #  restart: unless-stopped
+ #  volumes:
+ #    - /var/run/docker.sock:/var/run/docker.sock
+ #  environment:
+ #    # 与上方 app 服务的 WATCHTOWER_HTTP_API_TOKEN 保持一致；留空均使用同一内置默认值
+ #    - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-outlook-mail-plus-watchtower-default}
+ #    - WATCHTOWER_HTTP_API_UPDATE=true
+ #    - WATCHTOWER_CLEANUP=true
+ #    # 禁用定时轮询，仅通过界面触发更新
+ #    - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
+ #  command: --http-api-update --label-enable
+ #  labels:
+ #    - "com.centurylinklabs.watchtower.enable=false"
+ #  networks:
+ #    - outlook-net
 
 networks:
   outlook-net:
